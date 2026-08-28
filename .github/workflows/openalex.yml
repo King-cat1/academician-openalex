@@ -1,0 +1,49 @@
+name: Run OpenAlex academician disambiguation
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_rows:
+        description: "0 = all 2052; positive integer = smoke test"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  disambiguate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
+      MAX_ROWS: ${{ github.event.inputs.max_rows || '0' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Verify secret exists
+        run: |
+          if [ -z "$OPENALEX_API_KEY" ]; then
+            echo "OPENALEX_API_KEY secret is missing."
+            exit 1
+          fi
+
+      - name: Run disambiguation
+        run: python scripts/run_openalex_disambiguation.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: academician-openalex-results
+          path: output/
+          if-no-files-found: warn
+          retention-days: 30
