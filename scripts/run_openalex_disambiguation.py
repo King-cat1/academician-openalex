@@ -199,18 +199,25 @@ def institution_aliases(inst_obj):
     return [v for v in vals if v]
 
 def target_affiliation_aliases(cn):
-    aliases = [cn or ""]
+    """
+    Return target affiliation aliases with a specificity flag.
+    Parent bodies such as "Chinese Academy of Sciences" are useful evidence,
+    but they must never count like an exact institute/university match.
+    """
+    cn = cn or ""
+    aliases = [(cn, "specific")]
     for k, vals in COMMON_CN_EN.items():
-        if k in (cn or ""):
-            aliases.extend(vals)
-    # CAS institute name: preserve core institute tokens for partial evidence
+        if k in cn:
+            # If the row names a specific CAS institute, CAS itself is only a parent-level alias.
+            level = "parent" if (k == "中国科学院" and cn != "中国科学院") else "specific"
+            aliases.extend((v, level) for v in vals)
     return aliases
 
 def affiliation_score(target_cn, author_obj):
     if not target_cn:
         return (0.0, "")
     targets = target_affiliation_aliases(target_cn)
-    target_norms = [norm(x) for x in targets if x]
+    target_norms = [(norm(x), level) for x, level in targets if x]
     insts = []
     for aff in author_obj.get("affiliations") or []:
         inst = aff.get("institution") or {}
@@ -232,16 +239,20 @@ def affiliation_score(target_cn, author_obj):
         except Exception:
             continue
         names = institution_aliases(inst)
-        for t in target_norms:
+        for t, level in target_norms:
             for n in names:
                 nn = norm(n)
                 if not t or not nn:
                     continue
                 if t == nn:
-                    return (5.0, n)
+                    score = 2.0 if level == "parent" else 5.0
+                    if score > best:
+                        best, evidence = score, n
+                    continue
                 if len(t) >= 5 and (t in nn or nn in t):
-                    if 4.0 > best:
-                        best, evidence = 4.0, n
+                    score = 1.5 if level == "parent" else 4.0
+                    if score > best:
+                        best, evidence = score, n
         # Chinese substring evidence from alternate native names
         tc = norm(target_cn)
         for n in names:
@@ -298,7 +309,22 @@ def candidate_authors(row):
     })
     return data.get("results") or []
 
+def trusted_anchor_level(row):
+    """
+    Only DOI rows that were explicitly audited as A/B are treated as anchors.
+    Legacy values such as "原表已有" are NOT trusted anchors.
+    """
+    v = str(row.get("verified_confidence") or "").strip().upper()
+    if v == "A":
+        return "A"
+    if v == "B":
+        return "B"
+    return ""
+
 def authors_from_anchor(row):
+    # Never let an old/unreviewed DOI determine identity.
+    if trusted_anchor_level(row) not in ("A", "B"):
+        return []
     doi = doi_clean(row.get("verified_doi"))
     if not doi:
         return []
@@ -320,28 +346,49 @@ def authors_from_anchor(row):
 
 def choose_author(row):
     candidates = authors_from_anchor(row)
-    method = "verified_doi_anchor" if candidates else "author_name_filter"
+    method = "trusted_doi_anchor" if candidates else "author_name_filter"
     if not candidates:
         candidates = candidate_authors(row)
+
     scored = []
     for a in candidates:
         s = score_author(row, a)
         scored.append((s["score"], s, a))
     scored.sort(key=lambda x: (x[0], (x[2].get("cited_by_count") or 0)), reverse=True)
+
     if not scored:
         return {"status":"no_candidate","method":method,"candidates":[]}
+
     top_score, details, top = scored[0]
     second = scored[1][0] if len(scored)>1 else -99
     margin = top_score-second
-    anchored = bool(row.get("verified_doi"))
-    if anchored and details["name_score"] >= 2.6 and (details["affiliation_score"] >= 4 or margin >= 1.5):
-        status="A"
-    elif top_score >= 8.0 and margin >= 1.0:
-        status="A"
-    elif top_score >= 6.2 and margin >= 0.6:
-        status="B"
+    anchor_level = trusted_anchor_level(row)
+    anchored_actual = method == "trusted_doi_anchor"
+
+    # Conservative rules:
+    # - exact/near-exact English name is mandatory;
+    # - generic CAS parent membership is not enough;
+    # - name-search matches require specific institution + topic evidence + margin.
+    if anchored_actual and anchor_level == "A" and details["name_score"] >= 3.5:
+        if details["affiliation_score"] >= 4.0 or details["topic_score"] >= 1.0:
+            status = "A"
+        else:
+            status = "B"
+    elif anchored_actual and anchor_level == "B" and details["name_score"] >= 3.5:
+        status = "B"
+    elif (details["name_score"] >= 3.6 and
+          details["affiliation_score"] >= 4.0 and
+          details["topic_score"] >= 0.7 and
+          top_score >= 8.0 and margin >= 1.0):
+        status = "A"
+    elif (details["name_score"] >= 3.6 and
+          details["affiliation_score"] >= 3.5 and
+          details["topic_score"] >= 0.7 and
+          top_score >= 7.5 and margin >= 0.6):
+        status = "B"
     else:
-        status="review"
+        status = "review"
+
     serial=[]
     for sc, det, a in scored[:5]:
         serial.append({
@@ -363,12 +410,122 @@ def choose_author(row):
         "candidates":serial,
     }
 
+def work_topic_score(row, work):
+    """Require the selected work itself—not only the author profile—to fit the academician's field."""
+    text = []
+    pt = work.get("primary_topic") or {}
+    if isinstance(pt, dict):
+        text.append(str(pt.get("display_name","")))
+        for k in ("field","domain","subfield"):
+            v = pt.get(k)
+            if isinstance(v, dict):
+                text.append(str(v.get("display_name","")))
+    for t in work.get("topics") or []:
+        if isinstance(t, dict):
+            text.append(str(t.get("display_name","")))
+            for k in ("field","domain","subfield"):
+                v=t.get(k)
+                if isinstance(v,dict):
+                    text.append(str(v.get("display_name","")))
+    joined = " ".join(text).lower()
+    keys=set()
+    division=row.get("election_division","")
+    for k, vals in DIVISION_KEYWORDS.items():
+        if k in division:
+            keys |= vals
+    if not keys:
+        return (0.5, "")
+    hits=sorted([x for x in keys if x in joined])
+    if not hits:
+        return (0.0, "")
+    return (min(3.0, 1.0 + 0.4*len(hits)), ",".join(hits[:6]))
+
+def work_author_affiliation_score(row, work, author_id):
+    """Use the target author's affiliation on the individual paper when OpenAlex provides it."""
+    target_pairs = target_affiliation_aliases(row.get("election_affiliation",""))
+    target_norms=[(norm(v), level) for v,level in target_pairs if v]
+    aid=compact_id(author_id)
+    best=0.0
+    evidence=""
+    for au in work.get("authorships") or []:
+        a=au.get("author") or {}
+        if compact_id(a.get("id")) != aid:
+            continue
+        for inst in au.get("institutions") or []:
+            names=[inst.get("display_name","")]
+            for n in names:
+                nn=norm(n)
+                for t,level in target_norms:
+                    if not t or not nn:
+                        continue
+                    if t == nn:
+                        sc = 1.5 if level=="parent" else 4.0
+                    elif len(t)>=5 and (t in nn or nn in t):
+                        sc = 1.0 if level=="parent" else 3.0
+                    else:
+                        sc = 0.0
+                    if sc > best:
+                        best,evidence=sc,n
+    return best,evidence
+
+def anchor_work_if_strict_foreign_journal(row, author_id):
+    """
+    For manually audited A DOI anchors, keep that same DOI as the identity paper.
+    Do not replace it with an unrelated high-citation work from a possibly merged OpenAlex profile.
+    """
+    if trusted_anchor_level(row) != "A":
+        return None
+    doi=doi_clean(row.get("verified_doi"))
+    if not doi:
+        return None
+    try:
+        w=get_work_by_doi(doi)
+    except Exception:
+        return None
+
+    # Verify the selected OpenAlex author is actually on the anchor work.
+    if compact_id(author_id) not in {
+        compact_id((a.get("author") or {}).get("id")) for a in (w.get("authorships") or [])
+    }:
+        return None
+
+    pl=w.get("primary_location") or {}
+    src0=pl.get("source") or {}
+    sid=src0.get("id")
+    if not sid:
+        return None
+    try:
+        src=get_source(sid)
+    except Exception:
+        src=src0
+    if (src.get("type") or "").lower() != "journal":
+        return None
+    country=(src.get("country_code") or "").upper()
+    sname=src.get("display_name") or src0.get("display_name") or ""
+    if country == "CN" or any(re.search(p,sname,re.I) for p in FOREIGN_SOURCE_EXCLUDE_PATTERNS):
+        return None
+
+    return {
+        "work_status":"selected_anchor",
+        "selected_doi":doi,
+        "selected_title":w.get("title") or w.get("display_name") or row.get("verified_title",""),
+        "selected_journal":sname or row.get("verified_journal",""),
+        "selected_year":w.get("publication_year") or row.get("verified_year",""),
+        "selected_source_country":country,
+        "selected_source_id":compact_id(src.get("id")),
+        "selected_work_id":compact_id(w.get("id")),
+        "selected_cited_by_count":w.get("cited_by_count") or 0,
+        "doi_url":f"https://doi.org/{doi}",
+        "work_topic_evidence":"trusted manually audited DOI anchor",
+        "work_affiliation_evidence":"",
+    }
+
 def list_foreign_journal_works(author_id):
     data = api_get("/works", {
         "filter": f"author.id:{author_id},type:article,has_doi:true,language:en,is_retracted:false",
         "sort": "cited_by_count:desc",
         "per_page": 100,
-        "select": "id,doi,title,display_name,publication_year,type,language,cited_by_count,primary_location,authorships",
+        "select": "id,doi,title,display_name,publication_year,type,language,cited_by_count,primary_location,authorships,primary_topic,topics",
     })
     works = []
     for w in data.get("results") or []:
@@ -395,14 +552,34 @@ def list_foreign_journal_works(author_id):
     return works
 
 def choose_work(row, author_id):
+    anchor = anchor_work_if_strict_foreign_journal(row, author_id)
+    if anchor:
+        return anchor
     try:
         works = list_foreign_journal_works(author_id)
     except Exception as e:
         return {"work_status":"error","work_error":str(e)}
     if not works:
         return {"work_status":"no_foreign_english_journal_doi"}
-    w, src = works[0]
-    doi = doi_clean(w.get("doi"))
+
+    ranked=[]
+    for w,src in works:
+        tscore, tev = work_topic_score(row,w)
+        # Known division but zero field overlap => do not use this work as an identity anchor.
+        if row.get("election_division") and tscore <= 0:
+            continue
+        afs, afev = work_author_affiliation_score(row,w,author_id)
+        cited=w.get("cited_by_count") or 0
+        # Field relevance dominates citation count; paper-level affiliation is secondary evidence.
+        rank = tscore*100 + afs*20 + math.log1p(cited)
+        ranked.append((rank,w,src,tscore,tev,afs,afev))
+
+    if not ranked:
+        return {"work_status":"no_field_consistent_foreign_journal_doi"}
+
+    ranked.sort(key=lambda x:x[0], reverse=True)
+    _,w,src,tscore,tev,afs,afev=ranked[0]
+    doi=doi_clean(w.get("doi"))
     return {
         "work_status":"selected",
         "selected_doi":doi,
@@ -414,6 +591,8 @@ def choose_work(row, author_id):
         "selected_work_id":compact_id(w.get("id")),
         "selected_cited_by_count":w.get("cited_by_count") or 0,
         "doi_url":f"https://doi.org/{doi}" if doi else "",
+        "work_topic_evidence":tev,
+        "work_affiliation_evidence":afev,
     }
 
 def write_csv(path, rows, fields):
@@ -462,7 +641,7 @@ def main():
         "name_score","affiliation_score","topic_score","affiliation_evidence","topic_evidence",
         "work_status","selected_doi","selected_title","selected_journal","selected_year",
         "selected_source_country","selected_source_id","selected_work_id","selected_cited_by_count",
-        "doi_url","error","work_error"
+        "doi_url","work_topic_evidence","work_affiliation_evidence","error","work_error"
     ]
     write_csv(OUTDIR/"academician_openalex_matches.csv", results, fields)
     cfields=["person_id","name_cn","english_name_candidate","author_id","display_name","score",
@@ -470,7 +649,7 @@ def main():
              "works_count","cited_by_count"]
     write_csv(OUTDIR/"author_candidates_top5.csv", candidates_out, cfields)
 
-    review=[r for r in results if r.get("status") not in ("A","B") or r.get("work_status")!="selected"]
+    review=[r for r in results if r.get("status") not in ("A","B") or r.get("work_status") not in ("selected","selected_anchor")]
     write_csv(OUTDIR/"review_required.csv", review, fields)
 
     cnt=Counter(r.get("status","") for r in results)
@@ -480,6 +659,7 @@ def main():
         "author_status_counts":dict(cnt),
         "work_status_counts":dict(wcnt),
         "selected_foreign_english_journal_doi":sum(1 for r in results if r.get("selected_doi")),
+        "trusted_anchor_policy":"only verified_confidence A/B can seed identity; legacy 原表已有 is not trusted",
         "api_strategy":"cheap author display_name.search filter + author.id works filter; singleton institution/source lookups are free",
     }
     with open(OUTDIR/"summary.json","w",encoding="utf-8") as f:
